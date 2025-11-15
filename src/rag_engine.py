@@ -91,7 +91,7 @@ Channel: {metadata.get('channel', 'Unknown')}
         
         return "\n\n".join(context_parts)
     
-    def _format_sources(self, results: List[Dict], max_sources: int = 3) -> List[Dict]:
+    def _format_sources(self, results: List[Dict], max_sources: int = 5) -> List[Dict]:
         """
         Format source citations.
         
@@ -217,7 +217,7 @@ Question: {question}"""
                         raise  # Re-raise on final attempt
             
             # Format sources
-            sources = self._format_sources(results, max_sources=3)
+            sources = self._format_sources(results, max_sources=5)  # Show top 5 sources
             
             # Calculate confidence
             distances = [r['score'] for r in results]

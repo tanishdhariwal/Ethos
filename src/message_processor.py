@@ -93,8 +93,11 @@ class MessageProcessor:
             if not text:
                 continue
             
-            # Extract metadata
-            metadata = extract_message_metadata(msg)
+            # Use resolved user name if available, otherwise fall back to user ID
+            user_name = msg.get('user_name', msg.get('user', 'Unknown'))
+            
+            # Extract metadata with resolved user name
+            metadata = extract_message_metadata(msg, user_name)
             
             # Create document
             doc = Document(

@@ -117,6 +117,39 @@ def get_message_limit() -> int:
             exit(0)
 
 
+def resolve_user_names(client: WebClient, messages: list) -> dict:
+    """
+    Resolve user IDs to real names.
+    
+    Args:
+        client: Slack WebClient instance
+        messages: List of message dictionaries
+        
+    Returns:
+        Dictionary mapping user IDs to names
+    """
+    user_map = {}
+    unique_users = {msg.get('user') for msg in messages if msg.get('user')}
+    
+    print("\n👥 Resolving user names...")
+    
+    for user_id in unique_users:
+        try:
+            response = client.users_info(user=user_id)
+            user_info = response['user']
+            # Prefer real_name, fall back to display_name or name
+            name = (user_info.get('real_name') or 
+                   user_info.get('profile', {}).get('display_name') or 
+                   user_info.get('name', user_id))
+            user_map[user_id] = name
+            print(f"  {user_id} → {name}")
+        except SlackApiError as e:
+            logger.warning(f"Could not resolve user {user_id}: {e}")
+            user_map[user_id] = user_id  # Fall back to ID
+    
+    return user_map
+
+
 def fetch_messages(client: WebClient, channel_id: str, limit: int) -> list:
     """
     Fetch messages from a channel with pagination.
@@ -172,7 +205,7 @@ def fetch_messages(client: WebClient, channel_id: str, limit: int) -> list:
         raise
 
 
-def save_messages(messages: list, channel_id: str, channel_name: str, file_path: str) -> None:
+def save_messages(messages: list, channel_id: str, channel_name: str, file_path: str, user_map: dict = None) -> None:
     """
     Save messages to JSON file with metadata.
     
@@ -181,11 +214,16 @@ def save_messages(messages: list, channel_id: str, channel_name: str, file_path:
         channel_id: Channel ID
         channel_name: Channel name
         file_path: Path to save JSON file
+        user_map: Optional dictionary mapping user IDs to names
     """
-    # Add channel metadata to each message
+    # Add channel metadata and user names to each message
     for msg in messages:
         msg['channel'] = channel_id
         msg['channel_name'] = channel_name
+        
+        # Add resolved user name if available
+        if user_map and msg.get('user') in user_map:
+            msg['user_name'] = user_map[msg['user']]
     
     # Create directory if needed
     os.makedirs(os.path.dirname(file_path), exist_ok=True)
@@ -231,8 +269,11 @@ def main():
         
         print(f"\n✅ Total messages fetched: {len(messages)}")
         
+        # Resolve user names
+        user_map = resolve_user_names(client, messages)
+        
         # Save messages
-        save_messages(messages, channel_id, channel_name, settings.MESSAGES_FILE)
+        save_messages(messages, channel_id, channel_name, settings.MESSAGES_FILE, user_map)
         print(f"✅ Messages saved to {settings.MESSAGES_FILE}")
         
         print("\n" + "=" * 60)

@@ -135,12 +135,13 @@ def is_valid_message(message: Dict) -> bool:
     return True
 
 
-def extract_message_metadata(message: Dict) -> Dict:
+def extract_message_metadata(message: Dict, user_name: Optional[str] = None) -> Dict:
     """
     Extract metadata from a Slack message.
     
     Args:
         message: Slack message dictionary
+        user_name: Optional resolved user name (if not provided, uses user ID)
         
     Returns:
         Metadata dictionary with user, timestamp, channel, etc.
@@ -153,9 +154,13 @@ def extract_message_metadata(message: Dict) -> Dict:
     except (ValueError, TypeError):
         formatted_time = 'Unknown'
     
+    # Use provided user name or fall back to user ID
+    user = user_name if user_name else message.get('user', 'Unknown')
+    
     # Build metadata
     metadata = {
-        'user': message.get('user', 'Unknown'),
+        'user': user,
+        'user_id': message.get('user', 'Unknown'),  # Keep original ID for reference
         'timestamp': ts,
         'formatted_time': formatted_time,
         'channel': message.get('channel', 'Unknown'),

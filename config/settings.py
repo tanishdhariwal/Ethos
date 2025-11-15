@@ -15,7 +15,7 @@ class Settings(BaseSettings):
     # AI Model Configuration
     GITHUB_TOKEN: Optional[str] = Field(None, description="GitHub token for GitHub Models API")
     OPENAI_API_KEY: Optional[str] = Field(None, description="OpenAI API key")
-    MODEL_NAME: str = Field(default="openai/gpt-5", description="LLM model name")
+    MODEL_NAME: str = Field(default="gpt-4o", description="LLM model name")
     TEMPERATURE: float = Field(default=0.3, ge=0.0, le=1.0, description="LLM temperature")
     
     # Vector Database Configuration
@@ -31,7 +31,7 @@ class Settings(BaseSettings):
     # RAG Configuration
     CHUNK_SIZE: int = Field(default=500, gt=0, description="Text chunk size")
     CHUNK_OVERLAP: int = Field(default=50, ge=0, description="Text chunk overlap")
-    TOP_K_RESULTS: int = Field(default=5, gt=0, description="Number of results to retrieve")
+    TOP_K_RESULTS: int = Field(default=10, gt=0, description="Number of results to retrieve")
     
     # Performance Configuration
     MAX_QUERY_LENGTH: int = Field(default=500, gt=0, description="Maximum query length")
