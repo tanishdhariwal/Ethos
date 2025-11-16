@@ -46,9 +46,25 @@ class MessageProcessor:
         """
         try:
             with open(file_path, 'r', encoding='utf-8') as f:
-                messages = json.load(f)
-            logger.info(f"Loaded {len(messages)} messages from {file_path}")
+                data = json.load(f)
+            
+            # Handle both old format (direct list) and new format (with metadata wrapper)
+            if isinstance(data, list):
+                # Old format: direct list of messages
+                messages = data
+                logger.info(f"Loaded {len(messages)} messages from {file_path} (legacy format)")
+            elif isinstance(data, dict) and 'messages' in data:
+                # New format: {metadata: {...}, messages: [...]}
+                messages = data['messages']
+                metadata = data.get('metadata', {})
+                logger.info(f"Loaded {len(messages)} messages from {file_path}")
+                logger.info(f"  Channels: {metadata.get('total_channels', '?')}")
+                logger.info(f"  Fetch time: {metadata.get('fetch_timestamp', 'Unknown')}")
+            else:
+                raise ValueError(f"Invalid message file format. Expected list or dict with 'messages' key.")
+            
             return messages
+            
         except FileNotFoundError:
             logger.error(f"Message file not found: {file_path}")
             raise
@@ -78,6 +94,7 @@ class MessageProcessor:
     def create_documents(self, messages: List[Dict]) -> List[Document]:
         """
         Convert messages to LangChain Document objects.
+        Threads are grouped: parent message with all replies as one document.
         
         Args:
             messages: List of message dictionaries
@@ -87,26 +104,85 @@ class MessageProcessor:
         """
         documents = []
         
+        # Group messages by thread
+        thread_groups = {}  # {thread_ts: [parent, reply1, reply2, ...]}
+        standalone_messages = []
+        
         for msg in messages:
-            # Clean text
+            if msg.get('is_thread_reply'):
+                # This is a reply - add to parent's group
+                parent_ts = msg.get('parent_ts')
+                if parent_ts not in thread_groups:
+                    thread_groups[parent_ts] = []
+                thread_groups[parent_ts].append(msg)
+            elif msg.get('reply_count', 0) > 0:
+                # This is a parent message with replies
+                thread_ts = msg.get('thread_ts') or msg.get('ts')
+                if thread_ts not in thread_groups:
+                    thread_groups[thread_ts] = []
+                thread_groups[thread_ts].insert(0, msg)  # Parent goes first
+            else:
+                # Standalone message (no thread)
+                standalone_messages.append(msg)
+        
+        # Create documents for standalone messages
+        for msg in standalone_messages:
             text = clean_slack_text(msg.get('text', ''))
             if not text:
                 continue
             
-            # Use resolved user name if available, otherwise fall back to user ID
             user_name = msg.get('user_name', msg.get('user', 'Unknown'))
-            
-            # Extract metadata with resolved user name
             metadata = extract_message_metadata(msg, user_name)
             
-            # Create document
             doc = Document(
                 page_content=text,
                 metadata=metadata
             )
             documents.append(doc)
         
-        logger.info(f"Created {len(documents)} documents from messages")
+        # Create compound documents for threads
+        for thread_ts, thread_messages in thread_groups.items():
+            if not thread_messages:
+                continue
+            
+            # Build thread document with context
+            thread_parts = []
+            parent_msg = None
+            
+            for i, msg in enumerate(thread_messages):
+                text = clean_slack_text(msg.get('text', ''))
+                if not text:
+                    continue
+                
+                user_name = msg.get('user_name', msg.get('user', 'Unknown'))
+                
+                if i == 0:
+                    # Parent message
+                    parent_msg = msg
+                    thread_parts.append(f"**Thread started by {user_name}:**\n{text}")
+                else:
+                    # Reply
+                    thread_parts.append(f"\n**Reply by {user_name}:**\n{text}")
+            
+            if not thread_parts or not parent_msg:
+                continue
+            
+            # Combine into single document
+            thread_content = "\n".join(thread_parts)
+            
+            # Use parent message metadata
+            user_name = parent_msg.get('user_name', parent_msg.get('user', 'Unknown'))
+            metadata = extract_message_metadata(parent_msg, user_name)
+            metadata['is_thread'] = True
+            metadata['reply_count'] = len(thread_messages) - 1
+            
+            doc = Document(
+                page_content=thread_content,
+                metadata=metadata
+            )
+            documents.append(doc)
+        
+        logger.info(f"Created {len(documents)} documents from messages ({len(thread_groups)} threads, {len(standalone_messages)} standalone)")
         return documents
     
     def chunk_documents(self, documents: List[Document]) -> List[Document]:
@@ -148,19 +224,19 @@ class MessageProcessor:
         
         # Load messages
         messages = self.load_messages(file_path)
-        logger.info(f"✅ Loaded {len(messages)} messages")
+        logger.info(f"Loaded {len(messages)} messages")
         
         # Filter messages
         valid_messages = self.filter_messages(messages)
-        logger.info(f"✅ Filtered to {len(valid_messages)} valid messages")
+        logger.info(f"Filtered to {len(valid_messages)} valid messages")
         
         # Create documents
         documents = self.create_documents(valid_messages)
-        logger.info(f"✅ Created {len(documents)} documents")
+        logger.info(f"Created {len(documents)} documents")
         
         # Chunk documents
         chunked_docs = self.chunk_documents(documents)
-        logger.info(f"✅ Created {len(chunked_docs)} chunks")
+        logger.info(f"Created {len(chunked_docs)} chunks")
         
         logger.info("Message processing pipeline completed")
         return chunked_docs

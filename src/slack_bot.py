@@ -1,7 +1,8 @@
 """Main Slack bot application using Socket Mode."""
 
 import time
-from typing import Dict
+import re
+from typing import Dict, Tuple, Optional
 from collections import defaultdict
 from datetime import datetime, timedelta
 from slack_bolt import App
@@ -24,6 +25,37 @@ rag_engine: RAGEngine = None
 user_requests = defaultdict(list)
 RATE_LIMIT_WINDOW = 60  # seconds
 MAX_REQUESTS_PER_MINUTE = 2
+
+
+def extract_channel_filter(text: str) -> Tuple[str, Optional[str]]:
+    """
+    Extract channel filter from question text.
+    
+    Args:
+        text: Question text
+        
+    Returns:
+        Tuple of (cleaned_question, channel_name or None)
+    """
+    # Pattern: "in #channel" or "from #channel" or "in channel"
+    # Channel names can contain letters, numbers, hyphens, and underscores
+    patterns = [
+        r'\bin\s+#([\w-]+)',          # "in #general" or "in #dev-team"
+        r'\bfrom\s+#([\w-]+)',        # "from #general" or "from #project-alpha"
+        r'\bin\s+([\w-]+)\s+channel', # "in general channel" or "in dev-team channel"
+    ]
+    
+    for pattern in patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            channel_name = match.group(1)
+            # Remove the filter phrase from the question
+            cleaned_text = re.sub(pattern, '', text, flags=re.IGNORECASE).strip()
+            # Clean up multiple spaces
+            cleaned_text = re.sub(r'\s+', ' ', cleaned_text)
+            return cleaned_text, channel_name
+    
+    return text, None
 
 
 def check_rate_limit(user_id: str) -> tuple[bool, int]:
@@ -89,7 +121,16 @@ def format_response(result: Dict, include_typing: bool = False) -> str:
 
 def get_help_message() -> str:
     """Get help message for users."""
-    return """👋 Hi! I'm *Ethos*, your team's memory assistant.
+    # Get available channels
+    channels_list = ""
+    if vector_store:
+        available_channels = vector_store.get_available_channels()
+        if available_channels:
+            channels_list = "\n\n📚 *Available channels:*\n" + "\n".join([f"• #{ch}" for ch in available_channels[:10]])
+            if len(available_channels) > 10:
+                channels_list += f"\n• ...and {len(available_channels) - 10} more"
+    
+    return f"""👋 Hi! I'm *Ethos*, your team's memory assistant.
 
 Ask me questions about past conversations, like:
 • What did we decide about the API design?
@@ -100,8 +141,9 @@ Ask me questions about past conversations, like:
 You can:
 • @mention me: `@Ethos What did we discuss about...`
 • Use slash command: `/ask What did we discuss about...`
+• Filter by channel: `@Ethos in #general what did we discuss...`
 
-I'll search through your team's conversation history and provide answers with sources! 🔍"""
+I'll search through your team's conversation history and provide answers with sources! 🔍{channels_list}"""
 
 
 @app.event("app_mention")
@@ -114,6 +156,7 @@ def handle_mention(event, say, logger):
         say: Function to send messages
         logger: Logger instance
     """
+    user = None
     try:
         # Extract question from event
         text = event.get('text', '')
@@ -138,29 +181,47 @@ def handle_mention(event, say, logger):
             say(get_help_message())
             return
         
+        # Extract channel filter if present
+        question, channel_filter = extract_channel_filter(question)
+        
         # Sanitize query
         question = sanitize_query(question, max_length=settings.MAX_QUERY_LENGTH)
         
         # Show typing indicator with rate limit info
-        if remaining > 0:
-            say(f"🤔 Let me search... (You have {remaining} questions remaining this minute)")
-        else:
-            say("🤔 Let me search... (This is your last question for this minute)")
+        search_info = f"🤔 Let me search"
+        if channel_filter:
+            search_info += f" in #{channel_filter}"
+        search_info += f"... (You have {remaining} questions remaining this minute)" if remaining > 0 else "... (This is your last question for this minute)"
+        say(search_info)
         
-        # Get answer
+        # Get answer with timeout protection
         start_time = time.time()
-        result = rag_engine.ask(question, k=settings.TOP_K_RESULTS)
-        elapsed_time = time.time() - start_time
         
-        logger.info(f"Answer generated in {elapsed_time:.2f}s")
-        
-        # Format and send response
-        response = format_response(result)
-        say(response)
+        try:
+            result = rag_engine.ask(question, k=settings.TOP_K_RESULTS, channel_filter=channel_filter)
+            elapsed_time = time.time() - start_time
+            
+            logger.info(f"Answer generated in {elapsed_time:.2f}s")
+            
+            # Format and send response
+            response = format_response(result)
+            say(response)
+            
+        except TimeoutError:
+            logger.error(f"Query timeout after {time.time() - start_time:.2f}s")
+            say("⏱️ Your question is taking longer than expected. Please try a simpler question or try again later.")
+            
+        except Exception as answer_error:
+            logger.error(f"Error generating answer: {answer_error}", exc_info=True)
+            say("❌ I encountered an error while generating an answer. Please try again or rephrase your question.")
         
     except Exception as e:
         logger.error(f"Error handling mention: {e}", exc_info=True)
-        say("❌ Sorry, I encountered an error while processing your question. Please try again later.")
+        try:
+            say("❌ Sorry, I encountered an unexpected error. Please try again later.")
+        except:
+            # If even error message fails, log it
+            logger.error("Failed to send error message to user")
 
 
 @app.command("/ask")
@@ -174,6 +235,7 @@ def handle_ask_command(ack, command, say, logger):
         say: Function to send messages
         logger: Logger instance
     """
+    user_id = None
     try:
         # Acknowledge command immediately
         ack()
@@ -200,26 +262,43 @@ def handle_ask_command(ack, command, say, logger):
 Examples:
 • `/ask What did we decide about the API design?`
 • `/ask Who's working on the frontend?`
-• `/ask Why did we choose PostgreSQL?`""")
+• `/ask in #general Why did we choose PostgreSQL?`""")
             return
+        
+        # Extract channel filter if present
+        question, channel_filter = extract_channel_filter(question)
         
         # Sanitize query
         question = sanitize_query(question, max_length=settings.MAX_QUERY_LENGTH)
         
-        # Get answer
+        # Get answer with timeout protection
         start_time = time.time()
-        result = rag_engine.ask(question, k=settings.TOP_K_RESULTS)
-        elapsed_time = time.time() - start_time
         
-        logger.info(f"Answer generated in {elapsed_time:.2f}s")
-        
-        # Format and send response
-        response = format_response(result)
-        say(response)
+        try:
+            result = rag_engine.ask(question, k=settings.TOP_K_RESULTS, channel_filter=channel_filter)
+            elapsed_time = time.time() - start_time
+            
+            logger.info(f"Answer generated in {elapsed_time:.2f}s")
+            
+            # Format and send response
+            response = format_response(result)
+            say(response)
+            
+        except TimeoutError:
+            logger.error(f"Query timeout after {time.time() - start_time:.2f}s")
+            say("⏱️ Your question is taking longer than expected. Please try a simpler question or try again later.")
+            
+        except Exception as answer_error:
+            logger.error(f"Error generating answer: {answer_error}", exc_info=True)
+            say("❌ I encountered an error while generating an answer. Please try again or rephrase your question.")
         
     except Exception as e:
         logger.error(f"Error handling /ask command: {e}", exc_info=True)
-        say("❌ Sorry, I encountered an error while processing your question. Please try again later.")
+        try:
+            say("❌ Sorry, I encountered an unexpected error. Please try again later.")
+        except:
+            # If even error message fails, log it
+            logger.error("Failed to send error message to user")
 
 
 @app.event("message")
@@ -263,51 +342,103 @@ def main():
     try:
         # Initialize vector store
         logger.info("Loading vector store...")
-        vector_store = VectorStore(model_name=settings.EMBEDDING_MODEL)
-        vector_store.load_index(settings.FAISS_INDEX_PATH)
+        try:
+            vector_store = VectorStore(model_name=settings.EMBEDDING_MODEL)
+            vector_store.load_index(settings.FAISS_INDEX_PATH)
+            
+            stats = vector_store.get_stats()
+            logger.info(f"Vector store loaded: {stats['total_vectors']} vectors")
+            
+        except FileNotFoundError as e:
+            logger.error(f"❌ Index not found: {e}")
+            print("\n❌ ERROR: Vector index not found!")
+            print("Please run the following scripts first:")
+            print("1. python scripts/fetch_messages.py")
+            print("2. python scripts/index_messages.py")
+            return
         
-        stats = vector_store.get_stats()
-        logger.info(f"✅ Vector store loaded: {stats['total_vectors']} vectors")
+        except Exception as e:
+            logger.error(f"❌ Failed to load vector store: {e}", exc_info=True)
+            print(f"\n❌ ERROR loading vector store: {e}")
+            print("Try regenerating the index:")
+            print("  python scripts/index_messages.py")
+            return
         
         # Initialize RAG engine
         logger.info("Initializing RAG engine...")
-        rag_engine = RAGEngine(vector_store)
-        logger.info("✅ RAG engine initialized")
+        try:
+            rag_engine = RAGEngine(vector_store)
+            logger.info("✅ RAG engine initialized")
+            
+        except ValueError as e:
+            logger.error(f"❌ Configuration error: {e}")
+            print(f"\n❌ ERROR: {e}")
+            print("Please check your .env file and ensure GITHUB_TOKEN or OPENAI_API_KEY is set.")
+            return
+        
+        except Exception as e:
+            logger.error(f"Failed to initialize RAG engine: {e}", exc_info=True)
+            print(f"\nERROR initializing RAG engine: {e}")
+            return
         
         # Test the system
         logger.info("Running system test...")
-        test_result = vector_store.test_search("test")
-        if test_result:
-            logger.info("✅ System test passed")
-        else:
-            logger.warning("⚠️ System test failed, but continuing...")
+        try:
+            test_result = vector_store.test_search("test")
+            if test_result:
+                logger.info("System test passed")
+            else:
+                logger.warning("System test failed, but continuing...")
+        except Exception as e:
+            logger.warning(f"System test error: {e}, but continuing...")
         
         # Start Socket Mode handler
         logger.info("Starting Socket Mode handler...")
-        handler = SocketModeHandler(app, settings.SLACK_APP_TOKEN)
+        try:
+            handler = SocketModeHandler(app, settings.SLACK_APP_TOKEN)
+            
+            print("\n" + "=" * 60)
+            print("✅ Bot is running!")
+            print("=" * 60)
+            print(f"Model: {settings.MODEL_NAME}")
+            print(f"Vectors: {stats['total_vectors']}")
+            print(f"Channels: {stats.get('unique_channels', '?')}")
+            if stats.get('channels'):
+                for ch in stats['channels'][:5]:  # Show first 5 channels
+                    print(f"  • #{ch}")
+                if len(stats['channels']) > 5:
+                    print(f"  • ...and {len(stats['channels']) - 5} more")
+            print(f"Temperature: {settings.TEMPERATURE}")
+            print(f"Rate Limit: {MAX_REQUESTS_PER_MINUTE} questions/minute")
+            print("=" * 60)
+            print("\n🛡️ Enhanced with retry logic and error handling")
+            print("🌐 Multi-channel support enabled")
+            print("Press Ctrl+C to stop\n")
+            
+            handler.start()
+            
+        except KeyboardInterrupt:
+            print("\n\n👋 Shutting down gracefully...")
+            logger.info("Bot stopped by user")
+            
+        except Exception as e:
+            logger.error(f"❌ Socket Mode handler error: {e}", exc_info=True)
+            print(f"\n❌ ERROR: {e}")
+            print("Please check:")
+            print("- SLACK_BOT_TOKEN is valid")
+            print("- SLACK_APP_TOKEN is valid")
+            print("- Bot has correct permissions")
+            print("- Socket Mode is enabled in Slack app settings")
+            return
         
-        print("\n" + "=" * 60)
-        print("✅ Bot is running!")
-        print("=" * 60)
-        print(f"Model: {settings.MODEL_NAME}")
-        print(f"Vectors: {stats['total_vectors']}")
-        print(f"Temperature: {settings.TEMPERATURE}")
-        print("=" * 60)
-        print("\nPress Ctrl+C to stop\n")
-        
-        handler.start()
-        
-    except FileNotFoundError as e:
-        logger.error(f"❌ Index not found: {e}")
-        print("\n❌ ERROR: Vector index not found!")
-        print("Please run the following scripts first:")
-        print("1. python scripts/fetch_messages.py")
-        print("2. python scripts/index_messages.py")
-        return
+    except KeyboardInterrupt:
+        print("\n\n👋 Shutting down gracefully...")
+        logger.info("Bot stopped by user")
         
     except Exception as e:
-        logger.error(f"❌ Failed to start bot: {e}", exc_info=True)
-        print(f"\n❌ ERROR: {e}")
+        logger.error(f"❌ Unexpected error: {e}", exc_info=True)
+        print(f"\n❌ UNEXPECTED ERROR: {e}")
+        print("Check logs for details.")
         return
 
 

@@ -2,9 +2,10 @@
 
 import time
 from typing import Dict, List, Optional
-from openai import OpenAI, RateLimitError, APIError
+from openai import OpenAI, RateLimitError, APIError, APIConnectionError, Timeout
 from src.vector_store import VectorStore
 from src.utils import setup_logging, format_confidence_indicator, calculate_confidence, truncate_text
+from src.retry_handler import safe_openai_call, GITHUB_RETRY_CONFIG, retry_on_error
 from config.settings import settings
 
 logger = setup_logging()
@@ -118,27 +119,34 @@ Channel: {metadata.get('channel', 'Unknown')}
         
         return sources
     
-    def ask(self, question: str, k: int = 5) -> Dict:
+    def ask(self, question: str, k: int = 5, channel_filter: str = None) -> Dict:
         """
         Answer a question using RAG.
         
         Args:
             question: User question
             k: Number of documents to retrieve
+            channel_filter: Optional channel name to filter results
             
         Returns:
             Dict with answer, sources, and confidence
         """
         logger.info(f"Processing question: {question[:100]}...")
+        if channel_filter:
+            logger.info(f"  Channel filter: {channel_filter}")
         
         try:
-            # Search for relevant documents
-            results = self.vector_store.search(question, k=k)
+            # Search for relevant documents with optional channel filter
+            results = self.vector_store.search(question, k=k, channel_filter=channel_filter)
             
             if not results:
+                no_results_msg = "I couldn't find that information in the conversation history."
+                if channel_filter:
+                    no_results_msg += f" (searched in #{channel_filter})"
+                
                 logger.warning("No results found for query")
                 return {
-                    'answer': "I couldn't find that information in the conversation history.",
+                    'answer': no_results_msg,
                     'sources': [],
                     'confidence': 0.0,
                     'confidence_indicator': format_confidence_indicator(0.0)
@@ -165,56 +173,53 @@ Question: {question}"""
                 }
             ]
             
-            # Call OpenAI API with retry logic
-            max_retries = 3
-            retry_delay = 10  # Increased from 2 to 10 seconds for GitHub's strict limits
+            # Call OpenAI API with robust retry logic
+            @retry_on_error(
+                config=GITHUB_RETRY_CONFIG,
+                exceptions=(RateLimitError, APIError, APIConnectionError, Timeout),
+                on_retry=lambda e, attempt: print(
+                    f"\n⏳ API issue detected: {type(e).__name__}. Retrying (attempt {attempt + 1})...\n"
+                )
+            )
+            def call_llm():
+                response = self.client.chat.completions.create(
+                    messages=messages,
+                    model=settings.MODEL_NAME,
+                    # Note: GitHub Models doesn't support custom temperature for some models
+                    # temperature=settings.TEMPERATURE,
+                )
+                return response.choices[0].message.content.strip()
             
-            for attempt in range(max_retries):
-                try:
-                    response = self.client.chat.completions.create(
-                        messages=messages,
-                        model=settings.MODEL_NAME,
-                        # Note: GitHub Models doesn't support custom temperature for some models
-                        # temperature=settings.TEMPERATURE,
-                    )
-                    
-                    answer = response.choices[0].message.content.strip()
-                    
-                    # Print the answer to console for debugging
-                    print("\n" + "="*60)
-                    print("🤖 ETHOS RESPONSE:")
-                    print("="*60)
-                    print(f"Question: {question}")
-                    print(f"\nAnswer: {answer}")
-                    print("="*60 + "\n")
-                    
-                    break  # Success, exit retry loop
-                    
-                except RateLimitError as e:
-                    if attempt < max_retries - 1:
-                        wait_time = retry_delay * (2 ** attempt)  # Exponential backoff: 10s, 20s, 40s
-                        logger.warning(f"Rate limit hit. Retrying in {wait_time} seconds... (Attempt {attempt + 1}/{max_retries})")
-                        print(f"\n⏳ GitHub rate limit reached. Waiting {wait_time} seconds before retry...")
-                        print(f"💡 Tip: GitHub Models has strict free tier limits. Consider switching to OpenAI for better availability.\n")
-                        time.sleep(wait_time)
-                    else:
-                        # Max retries exceeded
-                        logger.error(f"Rate limit exceeded after {max_retries} attempts")
-                        return {
-                            'answer': "⏸️ GitHub Models is currently rate-limited. This API has very strict free tier limits.\n\n💡 **Suggestions:**\n• Wait 2-3 minutes before trying again\n• Switch to OpenAI (set OPENAI_API_KEY in .env)\n• Upgrade to GitHub Models Enterprise",
-                            'sources': [],
-                            'confidence': 0.0,
-                            'confidence_indicator': format_confidence_indicator(0.0),
-                            'error': 'rate_limit'
-                        }
-                        
-                except APIError as e:
-                    if attempt < max_retries - 1:
-                        wait_time = retry_delay * (2 ** attempt)
-                        logger.warning(f"API error: {e}. Retrying in {wait_time} seconds...")
-                        time.sleep(wait_time)
-                    else:
-                        raise  # Re-raise on final attempt
+            try:
+                answer = call_llm()
+                
+                # Print the answer to console for debugging
+                print("\n" + "="*60)
+                print("🤖 ETHOS RESPONSE:")
+                print("="*60)
+                print(f"Question: {question}")
+                print(f"\nAnswer: {answer}")
+                print("="*60 + "\n")
+                
+            except RateLimitError as e:
+                logger.error(f"Rate limit exceeded after all retries: {e}")
+                return {
+                    'answer': "⏸️ GitHub Models is currently rate-limited. This API has very strict free tier limits.\n\n💡 **Suggestions:**\n• Wait 2-3 minutes before trying again\n• Switch to OpenAI (set OPENAI_API_KEY in .env)\n• Upgrade to GitHub Models Enterprise",
+                    'sources': [],
+                    'confidence': 0.0,
+                    'confidence_indicator': format_confidence_indicator(0.0),
+                    'error': 'rate_limit'
+                }
+            
+            except (APIError, APIConnectionError, Timeout) as e:
+                logger.error(f"API error after all retries: {e}")
+                return {
+                    'answer': f"❌ API error: {type(e).__name__}. The service may be temporarily unavailable. Please try again in a moment.",
+                    'sources': [],
+                    'confidence': 0.0,
+                    'confidence_indicator': format_confidence_indicator(0.0),
+                    'error': str(e)
+                }
             
             # Format sources
             sources = self._format_sources(results, max_sources=5)  # Show top 5 sources
@@ -232,20 +237,10 @@ Question: {question}"""
                 'confidence_indicator': format_confidence_indicator(confidence)
             }
             
-        except RateLimitError as e:
-            logger.error(f"Rate limit error: {e}")
-            return {
-                'answer': "⏸️ I'm currently rate-limited by the AI service. Please wait a minute and try again.",
-                'sources': [],
-                'confidence': 0.0,
-                'confidence_indicator': format_confidence_indicator(0.0),
-                'error': 'rate_limit'
-            }
-            
         except Exception as e:
-            logger.error(f"Error processing question: {e}", exc_info=True)
+            logger.error(f"Unexpected error processing question: {e}", exc_info=True)
             return {
-                'answer': "❌ I encountered an error while processing your question. Please try again in a moment.",
+                'answer': f"❌ Unexpected error: {type(e).__name__}. Please try again or contact support if the issue persists.",
                 'sources': [],
                 'confidence': 0.0,
                 'confidence_indicator': format_confidence_indicator(0.0),
