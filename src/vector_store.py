@@ -7,6 +7,7 @@ import faiss
 from typing import List, Dict, Optional
 from sentence_transformers import SentenceTransformer
 from langchain_core.documents import Document
+from config.settings import settings
 from src.utils import setup_logging
 from src.retry_handler import safe_file_operation, retry_on_error, FAISS_RETRY_CONFIG
 
@@ -179,7 +180,7 @@ class VectorStore:
     
     def search(self, query: str, k: int = 5, channel_filter: str = None) -> List[Dict]:
         """
-        Search for similar documents.
+        Search for similar documents with priority channel boosting.
         
         Args:
             query: Search query
@@ -203,12 +204,16 @@ class VectorStore:
             convert_to_numpy=True
         ).astype('float32')
         
-        # Search FAISS index (get more results if filtering)
-        search_k = k * 3 if channel_filter else k
+        # Search FAISS index (get more results for filtering and re-ranking)
+        search_k = k * 3 if channel_filter else k * 2
         search_k = min(search_k, self.index.ntotal)  # Don't request more than available
         distances, indices = self.index.search(query_embedding, search_k)
         
-        # Format results
+        # Get priority channels from settings
+        priority_channels = [ch.lower() for ch in settings.PRIORITY_CHANNELS]
+        boost_factor = settings.PRIORITY_BOOST_FACTOR
+        
+        # Format and score results
         results = []
         for i, (distance, idx) in enumerate(zip(distances[0], indices[0])):
             if idx < len(self.documents):
@@ -220,18 +225,38 @@ class VectorStore:
                     if channel_filter.lower() not in doc_channel:
                         continue  # Skip this result
                 
+                # Apply priority boost to score
+                doc_channel = metadata.get('channel_name', '').lower()
+                is_priority = doc_channel in priority_channels
+                adjusted_score = float(distance)
+                
+                # Boost priority channels (lower score is better in L2 distance)
+                if is_priority:
+                    adjusted_score = adjusted_score * (1.0 - boost_factor)
+                    logger.debug(f"Priority boost applied to #{doc_channel}: {distance:.3f} -> {adjusted_score:.3f}")
+                
                 results.append({
                     'document': self.documents[idx],
                     'metadata': metadata,
-                    'score': float(distance),
-                    'rank': len(results) + 1
+                    'score': adjusted_score,
+                    'original_score': float(distance),
+                    'is_priority': is_priority,
+                    'rank': i + 1  # Original rank before re-sorting
                 })
-                
-                # Stop once we have enough results
-                if len(results) >= k:
-                    break
+        
+        # Re-sort by adjusted score
+        results.sort(key=lambda x: x['score'])
+        
+        # Update ranks and trim to k results
+        for i, result in enumerate(results[:k]):
+            result['rank'] = i + 1
+        
+        results = results[:k]
         
         logger.info(f"Search returned {len(results)} results for query: {query[:50]}...")
+        priority_count = sum(1 for r in results if r.get('is_priority', False))
+        if priority_count > 0:
+            logger.info(f"  {priority_count} results from priority channels")
         if channel_filter:
             logger.info(f"  Filtered by channel: {channel_filter}")
         

@@ -33,6 +33,25 @@ class Settings(BaseSettings):
     CHUNK_OVERLAP: int = Field(default=50, ge=0, description="Text chunk overlap")
     TOP_K_RESULTS: int = Field(default=10, gt=0, description="Number of results to retrieve")
     
+    # Priority Channel Configuration
+    PRIORITY_CHANNELS: list = Field(
+        default=[
+            "leadership",
+            "management", 
+            "executives",
+            "all-hands",
+            "announcements",
+            "important"
+        ],
+        description="Channels with high priority for search results"
+    )
+    PRIORITY_BOOST_FACTOR: float = Field(
+        default=0.3,
+        ge=0.0,
+        le=1.0,
+        description="Score boost for priority channel messages (0.0-1.0)"
+    )
+    
     # Performance Configuration
     MAX_QUERY_LENGTH: int = Field(default=500, gt=0, description="Maximum query length")
     RATE_LIMIT_PER_MINUTE: int = Field(default=10, gt=0, description="Rate limit per user")

@@ -81,8 +81,11 @@ Instructions:
         for i, result in enumerate(results, 1):
             doc = result['document']
             metadata = result['metadata']
+            is_priority = result.get('is_priority', False)
             
-            context_part = f"""[Message {i}]
+            priority_tag = " [PRIORITY CHANNEL]" if is_priority else ""
+            
+            context_part = f"""[Message {i}{priority_tag}]
 Text: {doc.page_content}
 From: {metadata.get('user', 'Unknown')}
 Time: {metadata.get('formatted_time', 'Unknown')}
@@ -112,8 +115,10 @@ Channel: {metadata.get('channel', 'Unknown')}
                 'user': metadata.get('user', 'Unknown'),
                 'timestamp': metadata.get('formatted_time', 'Unknown'),
                 'channel': metadata.get('channel', 'Unknown'),
+                'channel_name': metadata.get('channel_name', 'Unknown'),
                 'preview': truncate_text(doc.page_content, max_length=150),
-                'score': result['score']
+                'score': result['score'],
+                'is_priority': result.get('is_priority', False)
             }
             sources.append(source)
         

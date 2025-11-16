@@ -164,6 +164,7 @@ def extract_message_metadata(message: Dict, user_name: Optional[str] = None) -> 
         'timestamp': ts,
         'formatted_time': formatted_time,
         'channel': message.get('channel', 'Unknown'),
+        'channel_name': message.get('channel_name', 'Unknown'),  # Add channel name
         'thread_ts': message.get('thread_ts', ''),
         'message_type': message.get('type', 'message'),
         'subtype': message.get('subtype', 'normal')

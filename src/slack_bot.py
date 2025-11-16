@@ -110,7 +110,11 @@ def format_response(result: Dict, include_typing: bool = False) -> str:
     if sources:
         message_parts.append("\n\n📚 *Sources:*")
         for i, source in enumerate(sources, 1):
-            source_text = f"\n{i}. Message from *{source['user']}* at _{source['timestamp']}_"
+            # Add priority indicator
+            priority_badge = " ⭐ *[PRIORITY]*" if source.get('is_priority', False) else ""
+            channel_name = source.get('channel_name', 'Unknown')
+            
+            source_text = f"\n{i}. Message from *{source['user']}* at _{source['timestamp']}_ in #{channel_name}{priority_badge}"
             source_text += f"\n   _{source['preview']}_"
             message_parts.append(source_text)
     
